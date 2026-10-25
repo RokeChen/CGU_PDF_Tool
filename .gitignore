@@ -1,0 +1,28 @@
+# Python / 建置產物
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+
+# 舊版備份與本機紀錄
+*.bak.py
+*.bak.iss
+*.bak.bat
+*.bak.txt
+pdf_tool.bak.py
+build_log.txt
+installer_log.txt
+check_open.txt
+fontcheck.txt
+selftest_result.txt
+*.zip
+
+# 舊版截圖（含校徽）與使用者範例檔
+screens/
+tests/*.pdf
+tests/*.png
+
+# 長庚大學校徽（著作權屬學校，不放入開源儲存庫）
+assets/cgu_logo.png
+assets/cgu_icon.ico
