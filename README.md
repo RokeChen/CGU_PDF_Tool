@@ -24,6 +24,8 @@
 
 到 [Releases](../../releases) 下載最新的 `CGU_PDF_Tool_Setup_x.x.exe`（安裝版）。安裝不需要系統管理員權限。
 
+各版本新增與修改的功能請看 [版本更新說明（CHANGELOG）](CHANGELOG.md)。
+
 Word 轉 PDF 需要電腦上有 Microsoft Word；沒有 Word 時會自動改用免費的 [LibreOffice](https://zh-tw.libreoffice.org/)。
 
 ## 從原始碼執行與建置
