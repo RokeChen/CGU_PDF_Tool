@@ -15,7 +15,7 @@ else:
     FB = r"C:\Windows\Fonts\msjhbd.ttc"
     FR = r"C:\Windows\Fonts\msjh.ttc"
     TC = 0
-VERSION = "V2.4"
+VERSION = "V2.4.1"
 DARK, DARK2, ORANGE = (31, 31, 31), (14, 14, 14), (238, 130, 0)
 
 def font(path, size):

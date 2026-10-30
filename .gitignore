@@ -23,6 +23,3 @@ screens/
 tests/*.pdf
 tests/*.png
 
-# 長庚大學校徽（著作權屬學校，不放入開源儲存庫）
-assets/cgu_logo.png
-assets/cgu_icon.ico

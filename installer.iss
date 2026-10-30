@@ -2,7 +2,7 @@
 ; 編譯：build_installer.bat → dist\CGU_PDF_Tool_Setup_<版本>.exe
 ; 精靈圖片由 installer\make_images.py 產生（installer\img\*.bmp）
 #define MyAppName "長庚大學PDF簡易編輯工具"
-#define MyAppVersion "2.4"
+#define MyAppVersion "2.4.1"
 #define MyAppPublisher "CGU_RC"
 #define MyAppURL "https://www.cgu.edu.tw"
 #define MyAppExeName "CGU_PDF_Tool.exe"
