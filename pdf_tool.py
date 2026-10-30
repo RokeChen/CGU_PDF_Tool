@@ -55,7 +55,7 @@ import img2pdf
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QRect, QRectF, QSize, QPointF, QSettings, QByteArray, QObject, QUrl
 from PyQt6.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QIcon,
                          QTransform, QAction, QActionGroup, QKeySequence,
-                         QPainterPath, QPolygonF, QFont, QFontDatabase, QDesktopServices, QPageLayout)
+                         QPainterPath, QPolygonF, QFont, QFontDatabase, QDesktopServices, QPageLayout, QShortcut)
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QAbstractPrintDialog
 from PyQt6.QtWidgets import (
@@ -69,7 +69,7 @@ from PyQt6.QtWidgets import (
 
 
 # ---- 版本與著作權資訊 ----
-APP_VERSION = "V2.1"
+APP_VERSION = "V2.4"
 APP_AUTHOR = "CGU_RC"
 APP_YEAR = "2026"
 
@@ -799,26 +799,51 @@ def merge_pdfs(paths, out_path, progress=None):
     return out_path
 
 
+def open_as_pdf(path):
+    """開啟 PDF；圖片（JPG / PNG）轉成單頁 PDF 後開啟。有密碼的 PDF 丟出 RuntimeError"""
+    if path.lower().endswith(IMAGE_EXTS):
+        with fitz.open(path) as img:
+            return fitz.open("pdf", img.convert_to_pdf())
+    doc = fitz.open(path)
+    if doc.needs_pass:
+        doc.close()
+        raise RuntimeError(f"{os.path.basename(path)} 有密碼保護，請先解除密碼")
+    return doc
+
+
 def export_organized(src_path, page_specs, out_path, progress=None):
     """
-    依新的頁面排序與旋轉匯出 PDF。
-    page_specs：[(原始頁碼(0起算), 額外旋轉角度), ...]，順序即輸出順序；
-    清單中沒有的頁面視為已刪除。
+    依新的頁面排序與旋轉匯出 PDF（可混合多個來源檔）。
+    page_specs 每一項可以是：
+      (原始頁碼, 旋轉角度)             → 取自 src_path
+      (來源檔路徑, 原始頁碼, 旋轉角度) → 取自指定的 PDF / 圖片
+      (None, (寬, 高), 旋轉角度)       → 空白頁
+    順序即輸出順序；清單中沒有的頁面視為已刪除。
     """
     if not page_specs:
         raise ValueError("所有頁面都被刪除了，無法匯出")
-    src = fitz.open(src_path)
+    docs = {}
     out = fitz.open()
     n = len(page_specs)
-    for i, (idx, rot) in enumerate(page_specs):
-        out.insert_pdf(src, from_page=idx, to_page=idx)
-        page = out[-1]
-        page.set_rotation((page.rotation + rot) % 360)
-        if progress:
-            progress(int((i + 1) * 95 / n))
-    out.save(out_path, garbage=3, deflate=True)
-    out.close()
-    src.close()
+    try:
+        for i, spec in enumerate(page_specs):
+            src, idx, rot = (src_path, spec[0], spec[1]) if len(spec) == 2 else spec
+            if src is None:                                   # 空白頁
+                w, h = idx
+                page = out.new_page(width=w, height=h)
+            else:
+                if src not in docs:
+                    docs[src] = open_as_pdf(src)
+                out.insert_pdf(docs[src], from_page=idx, to_page=idx)
+                page = out[-1]
+            page.set_rotation((page.rotation + rot) % 360)
+            if progress:
+                progress(int((i + 1) * 95 / n))
+        out.save(out_path, garbage=3, deflate=True)
+    finally:
+        out.close()
+        for d in docs.values():
+            d.close()
     if progress:
         progress(100)
     return out_path
@@ -995,6 +1020,112 @@ class DigitalSignDialog(QDialog):
         st.setValue("dsign/reason", self.cmb_reason.currentText())
         st.setValue("dsign/location", self.ed_loc.text())
         self.accept()
+
+
+# ---------------- 打勾（核取方塊）----------------
+CHECK_TAG = "CGU_CHECK"          # 打勾註解的識別標記，再點一次可取消
+BOX_GLYPHS = set("□☐▢◻⬜❏❐❑❒▫")
+
+
+def find_boxes(page, area=None):
+    """
+    找出頁面上的框框（未旋轉頁面座標），回傳 [Rect]：
+      * 文字字元 □ ☐ 等（Word / 報表轉出的 PDF 常見）
+      * 向量繪製的小正方形（表單、PDF 產生器畫的框）
+    area 給定時只回傳與該範圍相交的框框。
+    """
+    boxes = []
+    try:
+        raw = page.get_text("rawdict")
+        for b in raw["blocks"]:
+            for ln in b.get("lines", []):
+                for sp in ln["spans"]:
+                    for ch in sp.get("chars", []):
+                        if ch["c"] in BOX_GLYPHS:
+                            r = fitz.Rect(ch["bbox"])
+                            side = min(r.width, r.height)
+                            c = (r.tl + r.br) / 2
+                            # 字形外框通常比看到的方框大一些，縮成置中的正方形
+                            side *= 0.82
+                            boxes.append(fitz.Rect(c.x - side / 2, c.y - side / 2, c.x + side / 2, c.y + side / 2))
+    except Exception:
+        pass
+    try:
+        for d in page.get_drawings():
+            r = fitz.Rect(d["rect"])
+            if 4 <= r.width <= 30 and 4 <= r.height <= 30 and 0.75 <= r.width / max(r.height, 0.1) <= 1.33 \
+                    and d.get("color") is not None:
+                if not any(abs(r.x0 - x.x0) < 1.5 and abs(r.y0 - x.y0) < 1.5 for x in boxes):
+                    boxes.append(r)
+    except Exception:
+        pass
+    if area is not None:
+        boxes = [b for b in boxes if b.intersects(area)]
+    return boxes
+
+
+def box_at(page, point, tol=3):
+    """點選位置附近的框框（容許些微誤差）"""
+    best = None
+    for b in find_boxes(page):
+        if (b + (-tol, -tol, tol, tol)).contains(point):
+            if best is None or b.width < best.width:
+                best = b
+    return best
+
+
+def check_annots(page, rect):
+    """與指定框框位置重疊的打勾註解"""
+    c = (rect.tl + rect.br) / 2
+    return [a for a in (page.annots() or []) if a.info.get("title") == CHECK_TAG
+            and (a.rect + (-2, -2, 2, 2)).contains(c)]
+
+
+def add_check_mark(page, box, symbol="check", color=(0, 0, 0)):
+    """在框框（未旋轉座標）畫上 ✓ / ✗ / ●；旋轉頁面也保持正向"""
+    vis = (fitz.Rect(box) * page.rotation_matrix).normalize()
+    x0, y0, w, h = vis.x0, vis.y0, vis.width, vis.height
+    lw = max(1.0, min(w, h) * 0.13)
+    to_page = lambda pts: [tuple(fitz.Point(x, y) * page.derotation_matrix) for x, y in pts]
+    if symbol == "dot":
+        r = fitz.Rect(x0 + w * 0.22, y0 + h * 0.22, x0 + w * 0.78, y0 + h * 0.78)
+        a = page.add_circle_annot((r * page.derotation_matrix).normalize())
+        a.set_colors(stroke=color, fill=color)
+        a.set_border(width=0)
+    elif symbol == "cross":
+        a = page.add_ink_annot([to_page([(x0 + w * 0.2, y0 + h * 0.2), (x0 + w * 0.8, y0 + h * 0.8)]),
+                                to_page([(x0 + w * 0.8, y0 + h * 0.2), (x0 + w * 0.2, y0 + h * 0.8)])])
+        a.set_colors(stroke=color)
+        a.set_border(width=lw)
+    else:   # ✓：像手寫一樣稍微超出框框右上方
+        a = page.add_ink_annot([to_page([(x0 + w * 0.15, y0 + h * 0.52), (x0 + w * 0.42, y0 + h * 0.82),
+                                          (x0 + w * 1.02, y0 - h * 0.12)])])
+        a.set_colors(stroke=color)
+        a.set_border(width=lw)
+    a.set_info(title=CHECK_TAG, content="打勾")
+    a.update()
+    return a
+
+
+def toggle_check(page, box, symbol="check", color=(0, 0, 0)):
+    """框框已勾 → 取消；未勾 → 打勾。回傳 True 表示打勾、False 表示取消"""
+    existing = check_annots(page, box)
+    if existing:
+        for a in existing:
+            page.delete_annot(a)
+        return False
+    add_check_mark(page, box, symbol, color)
+    return True
+
+
+def check_all_in(page, area, symbol="check", color=(0, 0, 0)):
+    """範圍內所有尚未勾選的框框都打勾，回傳勾選數量"""
+    n = 0
+    for b in find_boxes(page, area):
+        if not check_annots(page, b):
+            add_check_mark(page, b, symbol, color)
+            n += 1
+    return n
 
 
 # ---------------- 簽名 / 印章 ----------------
@@ -2754,6 +2885,10 @@ class MergeTab(BaseTab):
         super().__init__(main)
         lay = QVBoxLayout(self)
         lay.addWidget(QLabel("將多個 PDF 拖曳到清單中，用右側按鈕調整順序，再按「合併」："))
+        tip = QLabel("💡 想一邊合併、一邊調整頁面順序、旋轉或刪頁？請改用左側「組織頁面」→「插入檔案」，一個畫面就能完成。")
+        tip.setObjectName("PanelHint")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
         row = QHBoxLayout()
         self.list = DropListWidget(PDF_EXTS)
         self.list.filesDropped.connect(self.add_files)
@@ -2820,39 +2955,95 @@ class MergeTab(BaseTab):
 # 分頁 3：組織頁面
 # =====================================================================
 
+class PageGrid(QListWidget):
+    """組織頁面的縮圖網格：可拖曳排序，也可從檔案總管把 PDF / 圖片拖進來插入到放開的位置"""
+    filesDropped = pyqtSignal(list, int)          # (檔案路徑, 插入位置)
+
+    def _ext_files(self, e):
+        return local_files_from_event(e, PDF_EXTS + IMAGE_EXTS)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            if self._ext_files(e):
+                e.setDropAction(Qt.DropAction.CopyAction)
+                e.accept()
+            else:
+                e.ignore()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.setDropAction(Qt.DropAction.CopyAction)
+            e.accept()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            paths = self._ext_files(e)
+            if paths:
+                idx = self.indexAt(e.position().toPoint())
+                row = idx.row() if idx.isValid() else self.count()
+                if idx.isValid():                       # 放在縮圖右半邊 → 插在它後面
+                    r = self.visualRect(idx)
+                    if e.position().x() > r.center().x():
+                        row += 1
+                self.filesDropped.emit(paths, row)
+            e.accept()
+        else:
+            super().dropEvent(e)
+
+
 class OrganizeTab(FileDropMixin, BaseTab):
-    ROLE_INDEX = Qt.ItemDataRole.UserRole        # 原始頁碼
+    """
+    組織頁面（類似 Acrobat）：開啟一或多個 PDF / 圖片，在同一個畫面插入其他檔案、
+    拖曳排序、旋轉、刪除、插入空白頁，最後匯出成一個新 PDF。
+    """
+    ROLE_INDEX = Qt.ItemDataRole.UserRole        # 原始頁碼（空白頁為 (寬, 高)）
     ROLE_ROT = Qt.ItemDataRole.UserRole + 1      # 額外旋轉角度
     ROLE_PIX = Qt.ItemDataRole.UserRole + 2      # 原始縮圖（旋轉時用）
+    ROLE_SRC = Qt.ItemDataRole.UserRole + 3      # 來源檔路徑（空白頁為 None）
+    drop_exts = PDF_EXTS + IMAGE_EXTS
+    SRC_COLORS = ["#E8780F", "#1E7FD8", "#2E9E5B", "#7B4FD6", "#C0398E", "#0F9AA8", "#B7282E", "#6B6B6B"]
 
     def __init__(self, main):
         super().__init__(main)
         self.setAcceptDrops(True)
-        self.src_path = None
+        self.src_path = None            # 第一個來源檔（相容舊介面）
+        self.sources = []               # 來源檔路徑，依加入順序（決定 A、B、C 代號與顏色）
         lay = QVBoxLayout(self)
         top = QHBoxLayout()
         self.btn_open = QPushButton("開啟 PDF…")
-        self.lbl = QLabel("尚未載入（可直接把 PDF 拖進此分頁）")
+        self.btn_insert = QPushButton("＋ 插入檔案…")
+        self.btn_insert.setToolTip("把其他 PDF 或圖片插入到選取頁之後（沒選取時加在最後）")
+        self.btn_blank = QPushButton("＋ 空白頁")
+        self.btn_blank.setToolTip("在選取頁之後插入一張空白頁")
+        self.lbl = QLabel("尚未載入（可直接把 PDF 或圖片拖進來，一次拖多個就是合併）")
+        self.lbl.setWordWrap(True)
         top.addWidget(self.btn_open)
+        top.addWidget(self.btn_insert)
+        top.addWidget(self.btn_blank)
         top.addWidget(self.lbl, 1)
         lay.addLayout(top)
 
         # 縮圖網格：IconMode、由左到右自動換行，搭配 InternalMove 可用滑鼠拖曳排序
-        self.grid = QListWidget()
+        self.grid = PageGrid()
         self.grid.setViewMode(QListView.ViewMode.IconMode)
         self.grid.setFlow(QListView.Flow.LeftToRight)
         self.grid.setWrapping(True)
         self.grid.setResizeMode(QListView.ResizeMode.Adjust)
         self.grid.setMovement(QListView.Movement.Snap)
         self.grid.setIconSize(QSize(140, 180))
-        self.grid.setGridSize(QSize(165, 215))
+        self.grid.setGridSize(QSize(165, 230))
         self.grid.setSpacing(6)
         self.grid.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.grid.setDefaultDropAction(Qt.DropAction.MoveAction)
-        # IconMode 拖放後項目位置可能錯亂，順序改變後重新排版網格
-        self.grid.model().rowsMoved.connect(lambda *a: self.grid.doItemsLayout())
+        # IconMode 拖放後項目位置可能錯亂，順序改變後重新排版網格並更新頁碼
+        self.grid.model().rowsMoved.connect(lambda *a: self._after_change())
         self.grid.model().rowsInserted.connect(lambda *a: self.grid.doItemsLayout())
+        self.grid.filesDropped.connect(self.insert_files)
         lay.addWidget(self.grid, 1)
 
         row = QHBoxLayout()
@@ -2862,62 +3053,204 @@ class OrganizeTab(FileDropMixin, BaseTab):
         self.btn_fwd = QPushButton("◀ 往前移")
         self.btn_back = QPushButton("往後移 ▶")
         self.btn_export = QPushButton("匯出新 PDF…")
+        self.btn_export.setProperty("variant", "primary")
         for b in (self.btn_left, self.btn_right, self.btn_del, self.btn_fwd, self.btn_back):
             row.addWidget(b)
         row.addStretch()
         row.addWidget(self.btn_export)
         lay.addLayout(row)
-        lay.addWidget(QLabel("提示：可用 Ctrl / Shift 多選；直接拖曳縮圖可調整順序。"))
+        lay.addWidget(QLabel("提示：Ctrl / Shift 可多選，直接拖曳縮圖調整順序，Delete 鍵刪除。"
+                             "從檔案總管把 PDF / 圖片拖到兩頁之間即可插入；縮圖左上角的字母代表來源檔。"))
         lay.addWidget(self.progress)
 
         self.btn_open.clicked.connect(self.pick)
+        self.btn_insert.clicked.connect(self.pick_insert)
+        self.btn_blank.clicked.connect(self.insert_blank)
         self.btn_left.clicked.connect(lambda: self.rotate_selected(-90))
         self.btn_right.clicked.connect(lambda: self.rotate_selected(90))
         self.btn_del.clicked.connect(self.delete_selected)
         self.btn_fwd.clicked.connect(lambda: self.move_selected(-1))
         self.btn_back.clicked.connect(lambda: self.move_selected(1))
         self.btn_export.clicked.connect(self.export)
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self.grid, activated=self.delete_selected)
 
+    # ---------------- 開啟 / 插入 ----------------
     def on_files_dropped(self, paths):
-        self.load(paths[0])
+        """拖到分頁空白處：沒有內容時開啟，已有內容時加在最後"""
+        if self.grid.count() == 0:
+            self.load(paths[0])
+            if len(paths) > 1:
+                self.insert_files(paths[1:], self.grid.count())
+        else:
+            self.insert_files(paths, self.grid.count())
 
     def pick(self):
-        p, _ = QFileDialog.getOpenFileName(self, "開啟 PDF", "", "PDF (*.pdf)")
-        if p:
-            self.load(p)
+        if self.grid.count() and QMessageBox.question(
+                self, "開啟", "要清除目前的頁面，重新開啟檔案嗎？\n（若要加入其他檔案，請改用「插入檔案」）") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "開啟 PDF（可多選，依選取順序合併）", "",
+                                                "PDF 或圖片 (*.pdf *.jpg *.jpeg *.png)")
+        if paths:
+            self.grid.clear()
+            self.sources = []
+            self.on_files_dropped(paths)
+
+    def pick_insert(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "插入檔案", os.path.dirname(self.src_path or ""),
+                                                "PDF 或圖片 (*.pdf *.jpg *.jpeg *.png)")
+        if paths:
+            self.insert_files(paths, self._insert_row())
+
+    def _insert_row(self):
+        """插入位置：最後一個選取頁之後；沒有選取時加在最後"""
+        rows = [self.grid.row(it) for it in self.grid.selectedItems()]
+        return max(rows) + 1 if rows else self.grid.count()
 
     def load(self, path):
-        """讀取 PDF 並產生每頁縮圖"""
-        try:
-            doc = fitz.open(path)
-        except Exception as e:
-            return self.error(f"無法開啟 PDF：{e}")
+        """清空並開啟一個 PDF（或圖片）"""
         self.grid.clear()
-        self.src_path = path
-        for i, page in enumerate(doc):
-            zoom = 160 / max(page.rect.width, page.rect.height)
-            pix = fitz_pixmap_to_qpixmap(page.get_pixmap(matrix=fitz.Matrix(zoom, zoom)))
-            item = QListWidgetItem(thumb_icon(pix), f"第 {i + 1} 頁")
-            item.setData(self.ROLE_INDEX, i)
-            item.setData(self.ROLE_ROT, 0)
-            item.setData(self.ROLE_PIX, pix)
-            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
-            self.grid.addItem(item)
-            if i % 10 == 0:
-                QApplication.processEvents()   # 大檔載入時讓介面保持回應
-        self.lbl.setText(f"{os.path.basename(path)}（共 {len(doc)} 頁）")
-        doc.close()
-        self.status(f"已載入 {path}")
+        self.sources = []
+        self.src_path = None
+        self.insert_files([path], 0)
 
+    def _make_item(self, src, idx, page):
+        zoom = 160 / max(page.rect.width, page.rect.height)
+        pix = fitz_pixmap_to_qpixmap(page.get_pixmap(matrix=fitz.Matrix(zoom, zoom)))
+        item = QListWidgetItem()
+        item.setData(self.ROLE_SRC, src)
+        item.setData(self.ROLE_INDEX, idx)
+        item.setData(self.ROLE_ROT, 0)
+        item.setData(self.ROLE_PIX, pix)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        return item
+
+    def insert_files(self, paths, row):
+        """把 PDF / 圖片的所有頁面插入到指定位置"""
+        added = 0
+        for path in paths:
+            try:
+                doc = open_as_pdf(path)
+            except Exception as e:
+                self.error(f"無法開啟 {os.path.basename(path)}：{e}")
+                continue
+            if path not in self.sources:
+                self.sources.append(path)
+            if self.src_path is None:
+                self.src_path = path
+            for i, page in enumerate(doc):
+                self.grid.insertItem(row, self._make_item(path, i, page))
+                row += 1
+                added += 1
+                if i % 10 == 0:
+                    QApplication.processEvents()   # 大檔載入時讓介面保持回應
+            doc.close()
+        self._after_change()
+        if added:
+            self.status(f"已加入 {added} 頁")
+
+    def insert_blank(self):
+        if not self.grid.count():
+            return self.status("請先開啟 PDF")
+        row = self._insert_row()
+        ref = self.grid.item(max(0, row - 1))
+        w, h = 595, 842                                  # 預設 A4，與前一頁同尺寸
+        try:
+            if ref.data(self.ROLE_SRC):
+                with open_as_pdf(ref.data(self.ROLE_SRC)) as d:
+                    r = d[ref.data(self.ROLE_INDEX)].rect
+                    w, h = r.width, r.height
+            else:
+                w, h = ref.data(self.ROLE_INDEX)
+        except Exception:
+            pass
+        pm = QPixmap(int(160 * w / max(w, h)), int(160 * h / max(w, h)))
+        pm.fill(QColor("#FFFFFF"))
+        item = QListWidgetItem()
+        item.setData(self.ROLE_SRC, None)
+        item.setData(self.ROLE_INDEX, (w, h))
+        item.setData(self.ROLE_ROT, 0)
+        item.setData(self.ROLE_PIX, pm)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.grid.insertItem(row, item)
+        self._after_change()
+        self.grid.clearSelection()
+        item.setSelected(True)
+        self.status("已插入空白頁")
+
+    # ---------------- 畫面 ----------------
+    def _src_tag(self, src):
+        if src is None:
+            return "", "#9A9A9A"
+        i = self.sources.index(src) if src in self.sources else 0
+        return chr(ord("A") + i % 26), self.SRC_COLORS[i % len(self.SRC_COLORS)]
+
+    def _render_icon(self, it):
+        pix = it.data(self.ROLE_PIX).transformed(QTransform().rotate(it.data(self.ROLE_ROT)))
+        multi = len(self.sources) > 1
+        if True:                                         # 頁面外框；多個來源時左上角標示來源字母
+            pm = QPixmap(pix)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if it.data(self.ROLE_SRC) is not None:
+                p.setPen(QPen(QColor("#B8B8B8"), 1))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(pm.rect().adjusted(0, 0, -1, -1))
+            if it.data(self.ROLE_SRC) is None:
+                p.setPen(QPen(QColor("#BBBBBB"), 1, Qt.PenStyle.DashLine))
+                p.drawRect(pm.rect().adjusted(0, 0, -1, -1))
+                p.setPen(QColor("#9A9A9A"))
+                p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "空白頁")
+            elif multi:
+                tag, color = self._src_tag(it.data(self.ROLE_SRC))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(color))
+                p.drawRoundedRect(QRectF(3, 3, 22, 18), 4, 4)
+                p.setPen(QColor("#FFFFFF"))
+                f = QFont()
+                f.setBold(True)
+                f.setPointSize(9)
+                p.setFont(f)
+                p.drawText(QRectF(3, 3, 22, 18), Qt.AlignmentFlag.AlignCenter, tag)
+            p.end()
+            pix = pm
+        it.setIcon(thumb_icon(pix))
+
+    def _after_change(self):
+        """更新每頁的新頁碼標籤、來源標示與上方說明"""
+        multi = len(self.sources) > 1
+        for i in range(self.grid.count()):
+            it = self.grid.item(i)
+            src = it.data(self.ROLE_SRC)
+            if src is None:
+                sub = "空白頁"
+            elif multi:
+                sub = f"{self._src_tag(src)[0]}・原第 {it.data(self.ROLE_INDEX) + 1} 頁"
+            else:
+                sub = f"原第 {it.data(self.ROLE_INDEX) + 1} 頁"
+            it.setText(f"第 {i + 1} 頁\n{sub}")
+            self._render_icon(it)
+        self.grid.doItemsLayout()
+        if not self.sources:
+            self.lbl.setText("尚未載入（可直接把 PDF 或圖片拖進來，一次拖多個就是合併）")
+        elif not multi:
+            self.lbl.setText(f"{os.path.basename(self.sources[0])}（目前共 {self.grid.count()} 頁）")
+        else:
+            parts = []
+            for s_ in self.sources:
+                tag, color = self._src_tag(s_)
+                parts.append(f"<span style='background:{color};color:#fff;padding:0 4px;border-radius:3px'>"
+                             f"<b>{tag}</b></span> {os.path.basename(s_)}")
+            self.lbl.setText("　".join(parts) + f"　｜ 目前共 {self.grid.count()} 頁")
+
+    # ---------------- 編輯 ----------------
     def rotate_selected(self, deg):
         items = self.grid.selectedItems()
         if not items:
             return self.status("請先選取頁面")
         for it in items:
-            rot = (it.data(self.ROLE_ROT) + deg) % 360
-            it.setData(self.ROLE_ROT, rot)
-            pix = it.data(self.ROLE_PIX).transformed(QTransform().rotate(rot))
-            it.setIcon(thumb_icon(pix))
+            it.setData(self.ROLE_ROT, (it.data(self.ROLE_ROT) + deg) % 360)
+            self._render_icon(it)
 
     def delete_selected(self):
         items = self.grid.selectedItems()
@@ -2925,7 +3258,7 @@ class OrganizeTab(FileDropMixin, BaseTab):
             return self.status("請先選取頁面")
         for it in items:
             self.grid.takeItem(self.grid.row(it))
-        self.grid.doItemsLayout()
+        self._after_change()
         self.status(f"已刪除 {len(items)} 頁（匯出後才會生效）")
 
     def move_selected(self, delta):
@@ -2935,24 +3268,42 @@ class OrganizeTab(FileDropMixin, BaseTab):
             return
         it = self.grid.takeItem(row)
         self.grid.insertItem(new, it)
-        self.grid.doItemsLayout()
+        self._after_change()
         self.grid.setCurrentRow(new)
 
     def page_specs(self):
-        """依目前畫面順序取得 [(原始頁碼, 旋轉角度)]"""
+        """依目前畫面順序取得 [(原始頁碼, 旋轉角度)]（單一來源用；保留相容）"""
         return [(self.grid.item(i).data(self.ROLE_INDEX), self.grid.item(i).data(self.ROLE_ROT))
                 for i in range(self.grid.count())]
 
+    def page_items(self):
+        """依目前畫面順序取得 [(來源檔, 原始頁碼, 旋轉角度)]"""
+        return [(it.data(self.ROLE_SRC), it.data(self.ROLE_INDEX), it.data(self.ROLE_ROT))
+                for it in (self.grid.item(i) for i in range(self.grid.count()))]
+
     def export(self):
-        if not self.src_path:
+        if not self.grid.count():
             return self.error("請先開啟 PDF")
-        out, _ = QFileDialog.getSaveFileName(self, "匯出 PDF", "整理後.pdf", "PDF (*.pdf)")
+        base = os.path.splitext(self.src_path or "整理後")[0]
+        out, _ = QFileDialog.getSaveFileName(self, "匯出 PDF", unique_path(base + "_整理後.pdf"), "PDF (*.pdf)")
         if not out:
             return
-        self.run_worker(export_organized, self.src_path, self.page_specs(), out,
-                        busy_widgets=[self.btn_export],
-                        on_done=lambda p: (QMessageBox.information(self, "完成", f"已輸出：\n{p}"),
-                                           self.status("匯出完成：" + p)))
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+        self.run_worker(export_organized, None, self.page_items(), out,
+                        busy_widgets=[self.btn_export], on_done=self.export_done)
+
+    def export_done(self, path):
+        self.status("匯出完成：" + path)
+        box = QMessageBox(QMessageBox.Icon.Information, "完成", f"已輸出：\n{path}", parent=self)
+        btn_edit = box.addButton("在「編輯 PDF」開啟", QMessageBox.ButtonRole.ActionRole)
+        btn_dir = box.addButton("開啟資料夾", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("確定", QMessageBox.ButtonRole.AcceptRole)
+        box.exec()
+        if box.clickedButton() is btn_edit:
+            self.main.open_pdf(path)
+        elif box.clickedButton() is btn_dir:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
 
 # =====================================================================
@@ -3193,6 +3544,7 @@ def _legacy_icon(kind, color=INK, size=24):
 
 # Lucide 圖示（ISC License, https://lucide.dev ，v1.59.0）以 SVG 內嵌，exe 不需外部檔案
 LUCIDE_SVGS = {
+    'square-check': '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <rect width="18" height="18" x="3" y="3" rx="2" /> <path d="m9 12 2 2 4-4" /> </svg>',
     'shield-check': '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" /> <path d="m9 12 2 2 4-4" /> </svg>',
     'signature': '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="m21 17-2.156-1.868A.5.5 0 0 0 18 15.5v.5a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1c0-2.545-3.991-3.97-8.5-4a1 1 0 0 0 0 5c4.153 0 4.745-11.295 5.708-13.5a2.5 2.5 0 1 1 3.31 3.284" /> <path d="M3 21h18" /> </svg>',
     'link': '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" > <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" /> <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" /> </svg>',
@@ -3236,7 +3588,7 @@ ICON_NAMES = {
     "edit": "file-pen-line", "merge": "files", "organize": "layout-grid", "convert": "file-output",
     "watermark": "stamp", "select": "text-cursor", "text": "type", "image": "image-plus",
     "highlight": "highlighter", "rect": "square", "line": "minus", "pen": "pencil",
-    "note": "sticky-note", "link": "link", "sign": "signature", "whiteout": "eraser", "delannot": "trash-2", "ocr": "scan-text", "about": "info",
+    "note": "sticky-note", "link": "link", "sign": "signature", "check": "square-check", "whiteout": "eraser", "delannot": "trash-2", "ocr": "scan-text", "about": "info",
 }
 
 
@@ -3244,7 +3596,7 @@ ICON_NAMES = {
 TOOL_COLORS = {
     "edit": "#D93A49", "merge": "#7B4FD6", "organize": "#2E9E5B", "convert": "#1E7FD8", "watermark": "#C0398E",
     "select": "#D93A49", "text": "#1E7FD8", "image": "#2E9E5B", "highlight": "#D9A400", "rect": "#7B4FD6",
-    "line": "#0F9AA8", "pen": "#C0398E", "note": "#E0A100", "link": "#0B6BCB", "sign": "#B7282E", "whiteout": "#E0603A", "delannot": "#C62828",
+    "line": "#0F9AA8", "pen": "#C0398E", "note": "#E0A100", "link": "#0B6BCB", "sign": "#B7282E", "check": "#2E9E5B", "whiteout": "#E0603A", "delannot": "#C62828",
     "ocr": "#7B4FD6",
 }
 
@@ -3374,7 +3726,7 @@ QToolBar::separator {{ background: #DADADA; width: 1px; margin: 5px 6px; }}
 #CanvasBg, #CanvasScroll {{ background: #DCDCDC; border: none; }}
 #Canvas {{ background: #FFFFFF; color: #8A8A8A; font-size: 15px; }}
 #EditToolbar {{ background: #FFFFFF; border: none; border-bottom: 1px solid #D5D5D5; padding: 2px 8px; }}
-#EditToolbar QToolButton {{ padding: 3px 5px; font-size: 12px; min-width: 50px; }}
+#EditToolbar QToolButton {{ padding: 3px 2px; font-size: 12px; min-width: 46px; }}
 #ThumbList {{ background: #FAFAFA; border: none; }}
 #ThumbList::item {{ border: 2px solid transparent; border-radius: 4px; padding: 4px; color: #555; }}
 #ThumbList::item:selected {{ border-color: {ACCENT}; background: {TINT}; color: {ACCENT_DARK}; }}
@@ -3488,7 +3840,7 @@ class PageCanvas(QLabel):
         moved = (end - start).manhattanLength() > 4
         if self.mode == "pen" and len(self.points) > 1:
             self.strokeFinished.emit(list(self.points))
-        elif self.mode in ("highlight", "rect", "line", "whiteout", "link", "sign") and moved:
+        elif self.mode in ("highlight", "rect", "line", "whiteout", "link", "sign", "check") and moved:
             self.dragged.emit(start, end)
         else:
             self.clicked.emit(end)
@@ -3507,7 +3859,7 @@ class PageCanvas(QLabel):
                 p.drawLine(a, b)
         elif self.mode == "line":
             p.drawLine(self.start, self.current)
-        elif self.mode in ("highlight", "rect", "whiteout", "link", "sign"):
+        elif self.mode in ("highlight", "rect", "whiteout", "link", "sign", "check"):
             p.drawRect(QRect(self.start.toPoint(), self.current.toPoint()).normalized())
         p.end()
 
@@ -3985,6 +4337,8 @@ class EditTab(FileDropMixin, BaseTab):
         ("image", "插入圖片", "點一下要放圖片的位置，再選擇 PNG / JPG 圖檔。"),
         ("sign", "簽名印章", "在下方選一個簽名或印章，點一下頁面放上去，再拖曳移動、拖四角縮放，"
                           "按 Enter 或點旁邊確定。已蓋好的章點一下可重新調整或刪除。"),
+        ("check", "打勾", "點一下框框就打勾，再點一次取消；拖曳框選可一次勾選範圍內所有框框。"
+                       "沒有偵測到框框（例如掃描檔）時，會在點的位置打勾。"),
         ("highlight", "螢光標記", "拖曳框選要標記的文字。可調整顏色與不透明度。"),
         ("rect", "方框", "拖曳畫出方框。可調整顏色、線寬與不透明度。"),
         ("line", "直線", "拖曳畫出直線。可調整顏色、線寬與不透明度。"),
@@ -4187,6 +4541,28 @@ class EditTab(FileDropMixin, BaseTab):
         self.sign_box.setVisible(False)
         pl.addWidget(self.sign_box)
         self.refresh_signatures()
+
+        # ---- 打勾工具選項 ----
+        self.check_box = QWidget()
+        cf = QFormLayout(self.check_box)
+        cf.setContentsMargins(0, 0, 0, 0)
+        cf.setVerticalSpacing(10)
+        self.cmb_check_sym = QComboBox()
+        for label, key in (("✓ 打勾", "check"), ("✗ 打叉", "cross"), ("● 實心點", "dot")):
+            self.cmb_check_sym.addItem(label, key)
+        self.cmb_check_color = QComboBox()
+        for label, rgb in (("黑色", (0, 0, 0)), ("藍色", (0.11, 0.25, 0.63)), ("紅色", (0.8, 0.1, 0.1))):
+            self.cmb_check_color.addItem(label, rgb)
+        self.spin_check_size = QSpinBox()
+        self.spin_check_size.setRange(6, 40)
+        self.spin_check_size.setValue(12)
+        self.spin_check_size.setSuffix(" pt")
+        self.spin_check_size.setToolTip("沒有偵測到框框時（例如掃描檔）打勾的大小")
+        cf.addRow("符號", self.cmb_check_sym)
+        cf.addRow("顏色", self.cmb_check_color)
+        cf.addRow("大小", self.spin_check_size)
+        self.check_box.setVisible(False)
+        pl.addWidget(self.check_box)
 
         # ---- OCR：掃描檔辨識文字 ----
         self.ocr_box = QWidget()
@@ -4735,7 +5111,8 @@ class EditTab(FileDropMixin, BaseTab):
         self.hint.setText(info[1])
         if not self.tool_actions[key].isChecked():
             self.tool_actions[key].setChecked(True)
-        self.generic_box.setVisible(key != "sign")
+        self.generic_box.setVisible(key not in ("sign", "check"))
+        self.check_box.setVisible(key == "check")
         self.sign_box.setVisible(key == "sign")
         self.ocr_box.setVisible(key != "sign")
         self.render()                      # 切換到 / 離開超連結工具時更新連結外框
@@ -4789,6 +5166,24 @@ class EditTab(FileDropMixin, BaseTab):
                     a.set_info(title=os.environ.get("USERNAME", "使用者"))
                     a.update()
                 self.modify(add_note, pt, text)
+        elif mode == "check":
+            sym = self.cmb_check_sym.currentData()
+            rgb = tuple(self.cmb_check_color.currentData())
+            box = box_at(page, pt)
+            if box is None:                            # 沒有框框（掃描檔等）：點哪裡就勾哪裡
+                existing = [a for a in (page.annots() or []) if a.info.get("title") == CHECK_TAG
+                            and a.rect.contains(pt)]
+                if existing:
+                    return self.modify(lambda pg: [pg.delete_annot(a) for a in
+                                                   [x for x in (pg.annots() or []) if x.info.get("title") == CHECK_TAG
+                                                    and x.rect.contains(pt)]])
+                s_ = self.spin_check_size.value()
+                vp = pt * page.rotation_matrix
+                box = (fitz.Rect(vp.x - s_ / 2, vp.y - s_ / 2, vp.x + s_ / 2, vp.y + s_ / 2)
+                       * page.derotation_matrix).normalize()
+            res = {}
+            self.modify(lambda pg, b: res.update(on=toggle_check(pg, b, sym, rgb)), box)
+            self.status("已打勾" if res.get("on") else "已取消勾選")
         elif mode == "sign":
             if self.sign_overlay:                      # 正在調整時點旁邊 = 確定
                 return self.sign_overlay.commit()
@@ -4832,6 +5227,15 @@ class EditTab(FileDropMixin, BaseTab):
             self.modify(lambda pg, r: self.style_annot(pg.add_rect_annot(r)), rect)
         elif mode == "line":
             self.modify(lambda pg, x, y: self.style_annot(pg.add_line_annot(x, y)), p1, p2)
+        elif mode == "check":
+            page = self.doc[self.page_no]
+            if not find_boxes(page, rect):
+                return self.status("框選範圍內沒有偵測到框框")
+            sym = self.cmb_check_sym.currentData()
+            rgb = tuple(self.cmb_check_color.currentData())
+            res = {}
+            self.modify(lambda pg, r: res.update(n=check_all_in(pg, r, sym, rgb)), rect)
+            self.status(f"已勾選 {res.get('n', 0)} 個框框")
         elif mode == "sign":
             if self.sign_overlay:
                 return self.sign_overlay.commit()
@@ -5040,6 +5444,39 @@ class EditTab(FileDropMixin, BaseTab):
 # 主視窗：頂部標題列 + 主工具列 + 左側工具軌 + 內容區（QStackedWidget）+ 狀態列
 # =====================================================================
 
+STARTUP_NOTICE = "本軟體由長庚大學資訊中心 RC 開發"
+
+
+class StartupNotice(QDialog):
+    """每次開啟程式時顯示的開發單位提示"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(APP_NAME)
+        self.setModal(True)
+        self.setMinimumWidth(380)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 20, 24, 16)
+        lay.setSpacing(12)
+        top = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(logo_pixmap(56))
+        top.addWidget(logo)
+        info = QLabel(f"<div style='font-size:17px;font-weight:bold'>{APP_NAME}</div>"
+                      f"<div style='color:{ACCENT_BTN};font-weight:bold'>版本 {APP_VERSION}</div>")
+        top.addWidget(info, 1)
+        lay.addLayout(top)
+        msg = QLabel(STARTUP_NOTICE)
+        msg.setStyleSheet("font-size:15px; padding:6px 0;")
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(msg)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        bb.button(QDialogButtonBox.StandardButton.Ok).setText("確定")
+        bb.button(QDialogButtonBox.StandardButton.Ok).setProperty("primary", True)
+        bb.accepted.connect(self.accept)
+        lay.addWidget(bb, 0, Qt.AlignmentFlag.AlignCenter)
+
+
 class AboutDialog(QDialog):
     """「關於」對話框：名稱、版本、作者、著作權與開放原始碼授權聲明"""
 
@@ -5123,7 +5560,7 @@ class MainWindow(QMainWindow):
     RAIL = [
         ("edit", "編輯 PDF", "直接在頁面上修改文字、加入圖片、標記與註解"),
         ("merge", "合併檔案", "將多個 PDF 依序合併成一個檔案"),
-        ("organize", "組織頁面", "刪除、旋轉、重新排列頁面後匯出新的 PDF"),
+        ("organize", "組織頁面", "合併多個檔案、插入、刪除、旋轉、重新排列頁面，一次匯出新的 PDF"),
         ("convert", "格式轉換", "Word（.docx）/ 圖片轉 PDF，或將 PDF 轉為可編輯的 Word"),
         ("watermark", "文字浮水印", "在所有頁面中央壓印半透明文字"),
     ]
@@ -5366,6 +5803,7 @@ def main():
             f.write(f"{'OPEN PASS' if ok_ else 'OPEN FAIL'} {pdf} pages={len(w.edit_tab.doc) if ok_ else 0}\n")
         sys.exit(0 if ok_ else 1)
     w.show()
+    StartupNotice(w).exec()           # 每次開啟顯示開發單位提示
     pdf = startup_pdf(sys.argv)
     if pdf:
         w.open_pdf(pdf)
