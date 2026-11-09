@@ -1,6 +1,6 @@
 # CGU PDF Tool（長庚大學PDF簡易編輯工具）
 
-免費、離線、開源的 Windows PDF 編輯工具，給一般教職員日常使用：改字、合併、轉檔、簽名、蓋章、OCR，一個程式就搞定。
+免費、離線、開源的 PDF 編輯工具（Windows／macOS），給一般教職員日常使用：改字、合併、轉檔、簽名、蓋章、OCR，一個程式就搞定。
 
 **Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).**
 
@@ -22,15 +22,25 @@
 
 ## 下載
 
-到 [Releases](../../releases) 下載最新的 `CGU_PDF_Tool_Setup_x.x.exe`（安裝版）。安裝不需要系統管理員權限。
+到 [Releases](../../releases) 下載最新版：
+
+| 系統 | 檔案 | 說明 |
+|---|---|---|
+| Windows | `CGU_PDF_Tool_Setup_x.x.exe` | 安裝版，不需要系統管理員權限 |
+| Windows | `CGU_PDF_Tool.exe` | 免安裝版，直接執行 |
+| macOS（Apple Silicon M1 以上） | `CGU_PDF_Tool_mac_x.x.zip` | 免安裝版：解壓縮後直接開啟 `CGU PDF Tool.app` |
+| macOS（Apple Silicon M1 以上） | `CGU_PDF_Tool_mac_x.x.dmg` | 打開後把 App 拖到「應用程式」資料夾 |
+
+**Mac 第一次開啟**：程式沒有 Apple 開發者簽章，第一次開啟會出現「無法打開」或「無法驗證開發者」。
+請到「系統設定 → 隱私權與安全性」，在下方找到本程式，按「**強制打開**」（或「仍要打開」）並輸入密碼，之後就能正常使用。
 
 各版本新增與修改的功能請看 [版本更新說明（CHANGELOG）](CHANGELOG.md)。
 
-Word 轉 PDF 需要電腦上有 Microsoft Word；沒有 Word 時會自動改用免費的 [LibreOffice](https://zh-tw.libreoffice.org/)。
+Word 轉 PDF 需要電腦上有 Microsoft Word（Windows 或 Mac 版）；沒有 Word 時會自動改用免費的 [LibreOffice](https://zh-tw.libreoffice.org/)。
 
 ## 從原始碼執行與建置
 
-需要 Windows、Python 3.12（OCR 套件目前最高支援 3.12）。
+需要 Python 3.12（OCR 套件目前最高支援 3.12）。Windows 與 macOS 使用同一份程式碼。
 
 ```
 py -3.12 -m venv .venv
@@ -43,6 +53,14 @@ py -3.12 -m venv .venv
 ```
 .\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean CGU_PDF_Tool.spec
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+```
+
+macOS 版（需在 Mac 上建置）：
+
+```
+python3.12 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt pyinstaller
+.venv/bin/python -m PyInstaller --noconfirm --clean CGU_PDF_Tool_mac.spec
 ```
 
 正式發行版由 GitHub Actions（`.github/workflows/release.yml`）從本儲存庫的原始碼自動建置並簽章。

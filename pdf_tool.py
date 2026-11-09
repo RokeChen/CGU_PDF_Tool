@@ -52,7 +52,7 @@ from pypdf import PdfReader, PdfWriter
 from PIL import Image
 import img2pdf
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QRect, QRectF, QSize, QPointF, QSettings, QByteArray, QObject, QUrl
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QPoint, QRect, QRectF, QSize, QPointF, QSettings, QByteArray, QObject, QUrl, QEvent
 from PyQt6.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QIcon,
                          QTransform, QAction, QActionGroup, QKeySequence,
                          QPainterPath, QPolygonF, QFont, QFontDatabase, QDesktopServices, QPageLayout, QShortcut)
@@ -69,13 +69,41 @@ from PyQt6.QtWidgets import (
 
 
 # ---- 版本與著作權資訊 ----
-APP_VERSION = "V2.4.1"
+APP_VERSION = "V2.5"
 APP_AUTHOR = "CGU_RC"
 APP_YEAR = "2026"
 
 APP_LICENSE = "AGPL-3.0"
 APP_SOURCE_URL = "https://github.com/RokeChen/CGU_PDF_Tool"   # 原始碼網址，「關於」視窗會顯示連結
 import datetime
+
+IS_MAC = sys.platform == "darwin"
+MOD_KEY = "⌘" if IS_MAC else "Ctrl"      # 提示文字用的修飾鍵名稱（Mac 為 Command）
+
+
+def app_data_dir():
+    """程式資料夾（簽名庫等）：Windows 為 %LOCALAPPDATA%，Mac 為 ~/Library/Application Support"""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    elif IS_MAC:
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return os.path.join(base, "CGU_PDFTool")
+
+
+def mac_font_files():
+    """macOS 內建中文字型檔（蘋方放在系統資產資料夾，需另外尋找）"""
+    import glob
+    out = []
+    for pat in ("/System/Library/AssetsV2/com_apple_MobileAsset_Font*/*/AssetData/PingFang.ttc",
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc", "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc",
+                "/System/Library/Fonts/Supplemental/Songti.ttc",
+                "/System/Library/Fonts/Supplemental/Arial Unicode.ttf", "/Library/Fonts/Arial Unicode.ttf"):
+        out += sorted(glob.glob(pat))
+    return out
 
 # 長庚大學校徽（著作權屬長庚大學所有；透明背景 PNG，以 base64 內嵌，exe 不需外部檔案）
 APP_LOGO_B64 = (
@@ -234,7 +262,7 @@ def find_cjk_font():
         r"C:\Windows\Fonts\msjh.ttf",
         r"C:\Windows\Fonts\mingliu.ttc",   # 細明體
         r"C:\Windows\Fonts\kaiu.ttf",      # 標楷體
-        "/System/Library/Fonts/PingFang.ttc",
+        *mac_font_files(),                   # macOS：蘋方、黑體、宋體…
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -610,10 +638,16 @@ def ocr_rebuild_font():
             p = os.path.join(d, name)
             if os.path.exists(p):
                 return p
-    for p in ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",):
+    for p in ("/System/Library/Fonts/Supplemental/Songti.ttc", "/System/Library/Fonts/STHeiti Light.ttc",
+              "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"):
         if os.path.exists(p):
             return p
     return None
+
+
+def mac_word_available():
+    """Mac 是否安裝 Microsoft Word（Word 轉 PDF 用）"""
+    return IS_MAC and os.path.isdir("/Applications/Microsoft Word.app")
 
 
 def _norm_chars(t):
@@ -1130,8 +1164,7 @@ def check_all_in(page, area, symbol="check", color=(0, 0, 0)):
 
 # ---------------- 簽名 / 印章 ----------------
 def signature_dir():
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = os.path.join(base, "CGU_PDFTool", "signatures")
+    d = os.path.join(app_data_dir(), "signatures")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -1809,7 +1842,9 @@ def font_dirs():
     dirs = [os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"),
             os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
             "/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.fonts"),
-            "/System/Library/Fonts", "/Library/Fonts"]
+            "/System/Library/Fonts", "/System/Library/Fonts/Supplemental", "/Library/Fonts",
+            os.path.expanduser("~/Library/Fonts")]
+    dirs += sorted({os.path.dirname(f) for f in mac_font_files()})       # 蘋方所在的系統資產資料夾
     return [d for d in dirs if d and os.path.isdir(d)]
 
 
@@ -1832,32 +1867,38 @@ def font_index():
 # 字型名稱關鍵字 → 候選系統字型檔（依序嘗試；含 Linux 對應字型供測試）
 # 每項：(關鍵字, 一般, 粗體, 斜體, 粗斜體)
 FONT_MAP = [
-    (("標楷", "楷", "dfkaishu", "dfkai", "kaiu", "biaukai", "kaiti", "kai"), ["kaiu.ttf", "simkai.ttf"], None, None, None),
+    (("標楷", "楷", "dfkaishu", "dfkai", "kaiu", "biaukai", "kaiti", "kai"),
+     ["kaiu.ttf", "simkai.ttf", "biaukai.ttf", "songti.ttc"], None, None, None),
     (("新細明", "細明", "pmingliu", "mingliu", "ming", "mincho", "song", "宋"),
-     ["mingliu.ttc", "mingliub.ttc", "notoserifcjk-regular.ttc"], ["notoserifcjk-bold.ttc"], None, None),
-    (("微軟正黑", "正黑", "jhenghei", "msjh"), ["msjh.ttc", "msjh.ttf", "notosanscjk-regular.ttc"],
-     ["msjhbd.ttc", "msjhbd.ttf", "notosanscjk-bold.ttc"], None, None),
+     ["mingliu.ttc", "mingliub.ttc", "songti.ttc", "notoserifcjk-regular.ttc"], ["notoserifcjk-bold.ttc"], None, None),
+    (("微軟正黑", "正黑", "jhenghei", "msjh", "pingfang", "蘋方", "heiti", "黑體"),
+     ["msjh.ttc", "msjh.ttf", "pingfang.ttc", "stheiti light.ttc", "notosanscjk-regular.ttc"],
+     ["msjhbd.ttc", "msjhbd.ttf", "stheiti medium.ttc", "notosanscjk-bold.ttc"], None, None),
     (("微軟雅黑", "yahei", "msyh"), ["msyh.ttc", "msjh.ttc", "notosanscjk-regular.ttc"], ["msyhbd.ttc"], None, None),
     (("calibri",), ["calibri.ttf", "carlito-regular.ttf"], ["calibrib.ttf", "carlito-bold.ttf"],
      ["calibrii.ttf", "carlito-italic.ttf"], ["calibriz.ttf", "carlito-bolditalic.ttf"]),
     (("cambria",), ["cambria.ttc", "caladea-regular.ttf"], ["cambriab.ttf", "caladea-bold.ttf"],
      ["cambriai.ttf", "caladea-italic.ttf"], ["cambriaz.ttf", "caladea-bolditalic.ttf"]),
-    (("times", "roman", "tiro"), ["times.ttf", "liberationserif-regular.ttf", "dejavuserif.ttf"],
-     ["timesbd.ttf", "liberationserif-bold.ttf"], ["timesi.ttf", "liberationserif-italic.ttf"],
-     ["timesbi.ttf", "liberationserif-bolditalic.ttf"]),
-    (("courier", "mono", "consolas"), ["cour.ttf", "consola.ttf", "liberationmono-regular.ttf", "dejavusansmono.ttf"],
-     ["courbd.ttf", "liberationmono-bold.ttf"], ["couri.ttf", "liberationmono-italic.ttf"],
+    (("times", "roman", "tiro"), ["times.ttf", "times new roman.ttf", "liberationserif-regular.ttf", "dejavuserif.ttf"],
+     ["timesbd.ttf", "times new roman bold.ttf", "liberationserif-bold.ttf"],
+     ["timesi.ttf", "times new roman italic.ttf", "liberationserif-italic.ttf"],
+     ["timesbi.ttf", "times new roman bold italic.ttf", "liberationserif-bolditalic.ttf"]),
+    (("courier", "mono", "consolas"), ["cour.ttf", "consola.ttf", "courier new.ttf", "liberationmono-regular.ttf",
+                                       "dejavusansmono.ttf"],
+     ["courbd.ttf", "courier new bold.ttf", "liberationmono-bold.ttf"], ["couri.ttf", "liberationmono-italic.ttf"],
      ["courbi.ttf", "liberationmono-bolditalic.ttf"]),
     (("arial", "helvetica", "helv", "sans"), ["arial.ttf", "liberationsans-regular.ttf", "dejavusans.ttf"],
-     ["arialbd.ttf", "liberationsans-bold.ttf", "dejavusans-bold.ttf"],
-     ["ariali.ttf", "liberationsans-italic.ttf"], ["arialbi.ttf", "liberationsans-bolditalic.ttf"]),
+     ["arialbd.ttf", "arial bold.ttf", "liberationsans-bold.ttf", "dejavusans-bold.ttf"],
+     ["ariali.ttf", "arial italic.ttf", "liberationsans-italic.ttf"],
+     ["arialbi.ttf", "arial bold italic.ttf", "liberationsans-bolditalic.ttf"]),
     (("georgia",), ["georgia.ttf", "liberationserif-regular.ttf"], ["georgiab.ttf"], ["georgiai.ttf"], ["georgiaz.ttf"]),
     (("verdana", "tahoma", "segoe"), ["verdana.ttf", "tahoma.ttf", "segoeui.ttf", "dejavusans.ttf"],
      ["verdanab.ttf", "tahomabd.ttf", "segoeuib.ttf"], None, None),
 ]
 # 中文（CJK）通用備援：微軟正黑 → 新細明 → 標楷 → Noto CJK
-CJK_FALLBACK = ["msjh.ttc", "msjh.ttf", "mingliu.ttc", "kaiu.ttf", "notosanscjk-regular.ttc",
-                "notoserifcjk-regular.ttc", "droidsansfallbackfull.ttf"]
+CJK_FALLBACK = ["msjh.ttc", "msjh.ttf", "mingliu.ttc", "kaiu.ttf",
+                "pingfang.ttc", "stheiti light.ttc", "songti.ttc", "hiragino sans gb.ttc", "arial unicode.ttf",  # macOS
+                "notosanscjk-regular.ttc", "notoserifcjk-regular.ttc", "droidsansfallbackfull.ttf"]
 
 
 def strip_subset(name):
@@ -1892,16 +1933,20 @@ def strip_subset(name):
 
 # 編輯對話框 / 屬性面板可選的字型（顯示名稱, 候選檔名）；只列出系統中實際存在的
 UI_FONTS = [
-    ("標楷體", ["kaiu.ttf"]),
+    ("標楷體", ["kaiu.ttf", "biaukai.ttf"]),
     ("新細明體", ["mingliu.ttc", "pmingliu.ttf"]),
     ("細明體", ["mingliu.ttc", "mingliu.ttf"]),
     ("微軟正黑體", ["msjh.ttc", "msjh.ttf"]),
     ("微軟雅黑", ["msyh.ttc", "msyh.ttf"]),
-    ("Times New Roman", ["times.ttf"]),
+    ("Times New Roman", ["times.ttf", "times new roman.ttf"]),
     ("Arial", ["arial.ttf"]),
     ("Calibri", ["calibri.ttf"]),
     ("Cambria", ["cambria.ttc"]),
-    ("Courier New", ["cour.ttf"]),
+    ("Courier New", ["cour.ttf", "courier new.ttf"]),
+    # macOS 內建中文字型
+    ("蘋方-繁", ["pingfang.ttc"]),
+    ("黑體-繁", ["stheiti light.ttc"]),
+    ("宋體-繁", ["songti.ttc"]),
     # 非 Windows（測試 / Linux）對應字型
     ("Noto Serif CJK（明體類）", ["notoserifcjk-regular.ttc"]),
     ("Noto Sans CJK（黑體類）", ["notosanscjk-regular.ttc"]),
@@ -1927,7 +1972,7 @@ def list_ui_fonts():
 def default_ocr_font_path():
     """OCR 替換字型的預設值：有標楷體就用標楷體，否則第一個可用的中文字型"""
     fonts = dict(list_ui_fonts())
-    for k in ("標楷體", "新細明體", "AR PL UKai（楷體類）", "Noto Serif CJK（明體類）", "微軟正黑體"):
+    for k in ("標楷體", "新細明體", "宋體-繁", "AR PL UKai（楷體類）", "Noto Serif CJK（明體類）", "微軟正黑體", "蘋方-繁"):
         if k in fonts:
             return fonts[k]
     return None
@@ -1980,7 +2025,7 @@ def system_font_candidates(fontname, flags=0, text=""):
             names += (["arialbd.ttf", "liberationsans-bold.ttf"] if bold else []) + \
                      ["arial.ttf", "liberationsans-regular.ttf", "dejavusans.ttf"]
     if has_cjk(text):
-        names += (["msjhbd.ttc", "notosanscjk-bold.ttc"] if bold else []) + CJK_FALLBACK
+        names += (["msjhbd.ttc", "stheiti medium.ttc", "notosanscjk-bold.ttc"] if bold else []) + CJK_FALLBACK
     seen, out = set(), []
     for n in names:
         p = idx.get(n.lower())
@@ -2804,7 +2849,7 @@ class ConvertTab(BaseTab):
 
         self.chk_combine = QCheckBox("把所有圖片合併成一個 PDF（依清單順序）")
         lay.addWidget(self.chk_combine)
-        if word_available():
+        if word_available() or mac_word_available():
             _engine = "將使用 Microsoft Word"
         elif find_soffice():
             _engine = "未偵測到 Word，將使用 LibreOffice"
@@ -3059,7 +3104,7 @@ class OrganizeTab(FileDropMixin, BaseTab):
         row.addStretch()
         row.addWidget(self.btn_export)
         lay.addLayout(row)
-        lay.addWidget(QLabel("提示：Ctrl / Shift 可多選，直接拖曳縮圖調整順序，Delete 鍵刪除。"
+        lay.addWidget(QLabel(f"提示：{MOD_KEY} / Shift 可多選，直接拖曳縮圖調整順序，Delete 鍵刪除。"
                              "從檔案總管把 PDF / 圖片拖到兩頁之間即可插入；縮圖左上角的字母代表來源檔。"))
         lay.addWidget(self.progress)
 
@@ -4197,7 +4242,7 @@ class InlineEditor(QObject):
         ob, oi = (False, False) if self.ocr else span_style_flags(span)
         self.base_style = (ob, oi, False)
         self.btn_b, self.btn_i, self.btn_u = (self._style_btn(t, tip, on) for t, tip, on in (
-            ("B", "粗體 (Ctrl+B)", ob), ("I", "斜體 (Ctrl+I)", oi), ("U", "底線 (Ctrl+U)", False)))
+            ("B", f"粗體 ({MOD_KEY}+B)", ob), ("I", f"斜體 ({MOD_KEY}+I)", oi), ("U", f"底線 ({MOD_KEY}+U)", False)))
         f_ = self.btn_b.font(); f_.setBold(True); self.btn_b.setFont(f_)
         f_ = self.btn_i.font(); f_.setItalic(True); self.btn_i.setFont(f_)
         f_ = self.btn_u.font(); f_.setUnderline(True); self.btn_u.setFont(f_)
@@ -5063,7 +5108,7 @@ class EditTab(FileDropMixin, BaseTab):
             return
         if len(self.doc) <= 1:
             return self.status("文件只剩一頁，無法刪除")
-        if QMessageBox.question(self, "刪除頁面", f"確定要刪除第 {pno + 1} 頁嗎？（可用 Ctrl+Z 復原）") \
+        if QMessageBox.question(self, "刪除頁面", f"確定要刪除第 {pno + 1} 頁嗎？（可用 {MOD_KEY}+Z 復原）") \
                 != QMessageBox.StandardButton.Yes:
             return
         self.commit_inline()
@@ -5847,6 +5892,22 @@ def startup_pdf(argv):
     return None
 
 
+class MacFileOpenFilter(QObject):
+    """macOS：在 Finder 雙擊 PDF、或拖到 Dock 圖示時，系統以 FileOpen 事件送來檔案路徑"""
+
+    def __init__(self, window):
+        super().__init__()
+        self.window = window
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.FileOpen:
+            path = event.file()
+            if path and path.lower().endswith(".pdf"):
+                self.window.open_pdf(path)
+            return True
+        return False
+
+
 def main():
     # 命令列自我測試（不開視窗）：CGU_PDF_Tool.exe --selftest-ocr 結果.txt
     if "--selftest-ocr" in sys.argv:
@@ -5859,6 +5920,9 @@ def main():
     app.setStyleSheet(STYLE)
     app.setWindowIcon(app_window_icon())
     w = MainWindow()
+    if IS_MAC:
+        _fo = MacFileOpenFilter(w)
+        app.installEventFilter(_fo)
     # 驗證用：CGU_PDF_Tool.exe --check-open 結果.txt 檔案.pdf → 不顯示視窗，開檔後寫出結果並結束
     if "--check-open" in sys.argv:
         i = sys.argv.index("--check-open")
